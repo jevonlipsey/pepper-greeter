@@ -8,54 +8,66 @@ import sys
 import threading
 import argparse
 
+ROBOT_IP = "10.42.0.109"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LISTEN_FILE = os.path.join(HERE, "listen.txt")
 RESPONSE_FILE = os.path.join(HERE, "response.txt")
-ROBOT_IP = "10.42.0.109"
 
+# each poll is a few getData calls per tracked person, so keep it coarse
 NAME_TIMEOUT = 20.0
-POLL_INTERVAL = 0.5
-CLOSE_DISTANCE_M = 1.5
-DEPARTURE_FORGET_S = 5.0
-GOODBYE_GRACE_PERIOD = 1.0
+POLL_INTERVAL = 1.0
+
+MAX_DETECTION_RANGE_M = 5.0
+TIME_BEFORE_VISIBLE_S = 1.5
+TIME_BEFORE_GONE_S = 3.0
+
+# goodbye ~2s out
+DEPARTURE_FORGET_S = 1.5
+GOODBYE_GRACE_PERIOD = 0.5
+QUEUE_DROP_S = 4.0
+
+MAX_ASSOC_DISTANCE_M = 0.7
+ASSOC_HEIGHT_TOLERANCE_M = 0.3
 
 
 class HumanGreeter(object):
     def __init__(self, app):
         super(HumanGreeter, self).__init__()
-        # reset the handshake before anything that can block on the robot, so
-        # a stale "quit" from a previous shutdown never kills a listener that
-        # is already up; lets the two be started in any order.
+        # reset the handshake first
         self.clear_files()
         app.start()
         session = app.session
 
         self.memory = session.service("ALMemory")
 
-        # mac client libqi (2.8.x) can't subscribe to events on this 2.5.7 robot
-        # (memory.subscriber() raises Invalid signature, subscribeToEvent
-        # silently no-ops), so watch PeoplePerception/PeopleList and diff to
-        # synthesize JustArrived / JustLeft locally.
+        # mac client libqi 2.8 can't subscribe to events on this 2.5.7 robot
         self.tts = session.service("ALTextToSpeech")
         self.motion = session.service("ALMotion")
         self.robot_posture = session.service("ALRobotPosture")
         self.awareness = session.service("ALBasicAwareness")
+        try:
+            self.people_perception = session.service("ALPeoplePerception")
+        except Exception:
+            self.people_perception = None
 
         try:
             self.stand_up()
+            self.tune_people_perception()
 
-            self.awareness.setEngagementMode("FullyEngaged")
+            self.awareness.setEngagementMode("SemiEngaged")
             self.awareness.setTrackingMode("Head")
             self.awareness.startAwareness()
-            print("Awareness on: FullyEngaged, Head tracking")
+            print("Awareness on: SemiEngaged, Head tracking")
 
-            self.names = {}
-            self.greet_threads = {}
-            self.pending_goodbyes = {}
-            self.pending_goodbyes_lock = threading.Lock()
+            self.greeted = {}
+            self.greet_queue = []
+            self.greet_event = threading.Event()
+            self.state_lock = threading.Lock()
+            # one voice at a time, or crowd talks over itself
             self.talking = threading.Lock()
             self._people_read_ok = True
+            self._next_key = 1
 
             self.start_people_watcher()
         except KeyboardInterrupt:
@@ -71,9 +83,43 @@ class HumanGreeter(object):
         except Exception as e:
             print("WARNING: could not stand up: " + str(e))
 
+    def tune_people_perception(self):
+        pp = self.people_perception
+        if pp is None:
+            print("WARNING: ALPeoplePerception unavailable, using defaults")
+            return
+
+        for setter, value in (
+            ("setFastModeEnabled", False),
+            ("setMovementDetectionEnabled", True),
+            ("setMaximumDetectionRange", MAX_DETECTION_RANGE_M),
+            ("setTimeBeforeVisiblePersonDisappears", TIME_BEFORE_VISIBLE_S),
+            ("setTimeBeforePersonDisappears", TIME_BEFORE_GONE_S),
+        ):
+            try:
+                getattr(pp, setter)(value)
+            except Exception as e:
+                print("WARNING: " + setter + "(" + str(value) + ") failed: " + str(e))
+
+        try:
+            pp.resetPopulation()
+        except Exception as e:
+            print("WARNING: resetPopulation failed: " + str(e))
+
+        for getter in (
+            "getMaximumDetectionRange",
+            "getTimeBeforePersonDisappears",
+            "getTimeBeforeVisiblePersonDisappears",
+            "isFastModeEnabled",
+            "isMovementDetectionEnabled",
+        ):
+            try:
+                print("  " + getter + " = " + str(getattr(pp, getter)()))
+            except Exception as e:
+                print("  " + getter + " unavailable: " + str(e))
+
     def shutdown(self):
-        # safe to call from any point, even mid-__init__ when some services
-        # don't exist yet; Ctrl-C must always end back in Crouch, not stiff.
+        # safe to call mid-__init__ too; ctrl-c must always end in crouch
         try:
             self.stop_watching.set()
         except Exception:
@@ -101,60 +147,83 @@ class HumanGreeter(object):
             f.write("quit")
 
     def read_people(self):
-        # PeopleDetected is [ [ts, dur], [[id, x, y, z], ...], face stuff, count ],
-        # so each person's position comes straight off the row; fall back to
-        # bare PeopleList ids if the shape ever surprises us.
         try:
-            data = self.memory.getData("PeoplePerception/PeopleDetected")
+            ids = self.memory.getData("PeoplePerception/PeopleList")
             self._people_read_ok = True
         except Exception as e:
             if self._people_read_ok:
-                print(
-                    "WARNING: could not read PeoplePerception/PeopleDetected: " + str(e)
-                )
+                print("WARNING: could not read PeoplePerception/PeopleList: " + str(e))
             self._people_read_ok = False
             return {}
+        if not ids:
+            return {}
+
         people = {}
-        if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
-            for person in data[1]:
-                if not isinstance(person, list) or not person:
-                    continue
-                rid = int(person[0])
+        for rid in ids:
+            rid = int(rid)
+            people[rid] = {
+                "visible": None,
+                "not_seen": None,
+                "pos": None,
+                "height": None,
+            }
+            for field, key in (
+                ("visible", "IsVisible"),
+                ("not_seen", "NotSeenSince"),
+                ("pos", "PositionInRobotFrame"),
+                ("height", "RealHeight"),
+            ):
                 try:
-                    pos = [float(v) for v in person[1:4]]
+                    value = self.memory.getData(
+                        "PeoplePerception/Person/" + str(rid) + "/" + key
+                    )
                 except Exception:
-                    pos = None
-                people[rid] = pos
-        else:
-            try:
-                for rid in self.memory.getData("PeoplePerception/PeopleList"):
-                    people[int(rid)] = None
-            except Exception:
-                pass
+                    continue
+                if field == "visible":
+                    people[rid][field] = bool(value)
+                elif field == "pos":
+                    try:
+                        people[rid][field] = [float(v) for v in value]
+                    except Exception:
+                        people[rid][field] = None
+                else:
+                    try:
+                        people[rid][field] = float(value)
+                    except Exception:
+                        people[rid][field] = None
         return people
 
     def start_people_watcher(self):
         self.stop_watching = threading.Event()
         snapshot = self.read_people()
-        self.people_tracks = [
-            {"rid": rid, "pos": pos, "gone_at": None} for rid, pos in snapshot.items()
-        ]
+        self.people_tracks = []
+        for rid in sorted(snapshot):
+            self.people_tracks.append(self._new_track(rid, snapshot[rid]))
         present = sorted(snapshot)
         print(
             "Watching for arrivals/departures. People currently present: "
             + str(present)
         )
         if present:
-            # greet people already in view at startup too, after perception
-            # settles; follow each track object so an id churn mid-settle
-            # doesn't silently drop the greeting.
-            init = [t for t in self.people_tracks if t["rid"] in snapshot]
+            # follow the track objects
+            init = list(self.people_tracks)
             init_greet = threading.Thread(target=self._greet_existing, args=(init,))
             init_greet.daemon = True
             init_greet.start()
         t = threading.Thread(target=self.watch_people)
         t.daemon = True
         t.start()
+        self.start_greet_worker()
+
+    def _new_track(self, rid, info):
+        self._next_key += 1
+        return {
+            "key": self._next_key,
+            "rid": rid,
+            "pos": (info or {}).get("pos"),
+            "height": (info or {}).get("height"),
+            "gone_at": None,
+        }
 
     def _greet_existing(self, init_tracks):
         time.sleep(2.0)
@@ -162,7 +231,7 @@ class HumanGreeter(object):
         for tr in init_tracks:
             if tr["gone_at"] is None and tr not in greeted:
                 greeted.append(tr)
-                self.on_human_arrived(tr["rid"])
+                self.on_human_arrived(tr)
 
     def watch_people(self):
         while not self.stop_watching.is_set():
@@ -173,28 +242,38 @@ class HumanGreeter(object):
         now = time.time()
 
         for tr in self.people_tracks:
-            if tr["rid"] in current:
-                tr["pos"] = current[tr["rid"]]
-                tr["gone_at"] = None
+            info = current.get(tr["rid"])
+            if info is not None:
+                if info.get("pos"):
+                    tr["pos"] = info["pos"]
+                if info.get("height") is not None:
+                    tr["height"] = info["height"]
+                # start the departure clock from IsVisible rather than waiting
+                if info.get("visible") is False or (
+                    info.get("not_seen") is not None and info["not_seen"] > 0
+                ):
+                    if tr["gone_at"] is None:
+                        tr["gone_at"] = now
+                else:
+                    tr["gone_at"] = None
             elif tr["gone_at"] is None:
-                # start the confirmation window before calling it a departure
                 tr["gone_at"] = now
 
+        matched = set()
         for rid in sorted(current):
-            if any(
-                tr["rid"] == rid and tr["gone_at"] is None for tr in self.people_tracks
-            ):
+            if any(tr["rid"] == rid for tr in self.people_tracks):
                 continue
-            match = self._match_pending(rid, current[rid])
+            match = self._match_pending(rid, current[rid], matched)
             if match is not None:
-                # barely left the frame and came back a different id:
-                # it's the same face, keep the same thread of conversation
+                matched.add(id(match))
                 old_rid = match["rid"]
                 match["rid"] = rid
-                match["pos"] = current[rid]
+                info = current[rid]
+                if info.get("pos"):
+                    match["pos"] = info["pos"]
+                if info.get("height") is not None:
+                    match["height"] = info["height"]
                 match["gone_at"] = None
-                if old_rid in self.names:
-                    self.names[rid] = self.names.pop(old_rid)
                 print(
                     "Person id changed "
                     + str(old_rid)
@@ -203,32 +282,45 @@ class HumanGreeter(object):
                     + " (same person, ignoring)"
                 )
                 continue
-            self.people_tracks.append(
-                {"rid": rid, "pos": current[rid], "gone_at": None}
-            )
-            self.on_human_arrived(rid)
+            tr = self._new_track(rid, current[rid])
+            self.people_tracks.append(tr)
+            self.on_human_arrived(tr)
 
         for tr in self.people_tracks:
             if tr["gone_at"] is not None and now - tr["gone_at"] > DEPARTURE_FORGET_S:
-                self.on_human_left(tr["rid"])
+                self.on_human_left(tr)
                 tr["gone_at"] = "gone"
         self.people_tracks = [
             tr for tr in self.people_tracks if tr["gone_at"] != "gone"
         ]
 
-    def _match_pending(self, rid, pos):
-        # find a recently-vanished person whose last spot this new id landed on
+    def _match_pending(self, rid, info, matched):
+        # one-to-one, so a departing person can't be absorbed
+        if info is None or not info.get("pos"):
+            return None
+        pos = info["pos"]
+        height = info.get("height")
         now = time.time()
         best = None
-        best_dist = CLOSE_DISTANCE_M
+        best_dist = MAX_ASSOC_DISTANCE_M
         for tr in self.people_tracks:
-            if tr["gone_at"] is None:
+            if tr["gone_at"] is None or id(tr) in matched:
                 continue
             if now - tr["gone_at"] > DEPARTURE_FORGET_S:
                 continue
-            if pos is None or tr["pos"] is None:
+            if not tr["pos"]:
                 continue
-            d = ((pos[0] - tr["pos"][0]) ** 2 + (pos[1] - tr["pos"][1]) ** 2) ** 0.5
+            if (
+                height is not None
+                and tr["height"] is not None
+                and abs(height - tr["height"]) > ASSOC_HEIGHT_TOLERANCE_M
+            ):
+                continue
+            d = (
+                (pos[0] - tr["pos"][0]) ** 2
+                + (pos[1] - tr["pos"][1]) ** 2
+                + (pos[2] - tr["pos"][2]) ** 2
+            ) ** 0.5
             if d < best_dist:
                 best, best_dist = tr, d
         return best
@@ -263,85 +355,101 @@ class HumanGreeter(object):
 
             time.sleep(0.25)
 
-        # gave up
         with open(LISTEN_FILE, "w") as f:
             f.write("no")
         return None
 
-    def on_human_arrived(self, person_id):
-        """
-        Called by the people watcher when a new person id appears.
-        """
+    def on_human_arrived(self, tr):
+        print("A human has arrived! id = " + str(tr["rid"]))
+        with self.state_lock:
+            if tr["key"] in self.greeted:
+                return
+            if not any(t is tr for t in self.greet_queue):
+                self.greet_queue.append(tr)
+        self.greet_event.set()
 
-        with self.pending_goodbyes_lock:
-            pending = list(self.pending_goodbyes.items())
-            self.pending_goodbyes.clear()
-        if pending:
-            for _, timer in pending:
-                timer.cancel()
-            print(
-                "Someone came right back (was id "
-                + str([p for p, _ in pending])
-                + ", now id "
-                + str(person_id)
-                + "), skipping goodbye/re-greet"
-            )
-            return
-
-        print("A human has arrived! id = " + str(person_id))
-
-        t = threading.Thread(target=self.greet, args=(person_id,))
-        self.greet_threads[person_id] = t
+    def start_greet_worker(self):
+        t = threading.Thread(target=self.greet_worker)
+        t.daemon = True
         t.start()
 
-    def greet(self, person_id):
-        if not self.talking.acquire(False):
-            print("Already talking to someone, skipping id " + str(person_id))
-            return
-        try:
-            print("Greeting person " + str(person_id))
+    def _distance(self, tr):
+        if not tr["pos"]:
+            return 1e9
+        return (tr["pos"][0] ** 2 + tr["pos"][1] ** 2) ** 0.5
+
+    def _is_worth_greeting(self, tr):
+        if tr["gone_at"] is None:
+            return True
+        return (time.time() - tr["gone_at"]) <= QUEUE_DROP_S
+
+    def _pop_nearest(self):
+        with self.state_lock:
+            for t in list(self.greet_queue):
+                if not self._is_worth_greeting(t):
+                    self.greet_queue.remove(t)
+            if not self.greet_queue:
+                return None
+            nearest = min(self.greet_queue, key=self._distance)
+            self.greet_queue.remove(nearest)
+            return nearest
+
+    def greet_worker(self):
+        while not self.stop_watching.is_set():
+            self.greet_event.wait(0.5)
+            self.greet_event.clear()
+            while True:
+                tr = self._pop_nearest()
+                if tr is None:
+                    break
+                if not self._is_worth_greeting(tr):
+                    continue
+                self.greet(tr)
+
+    def greet(self, tr):
+        person_id = str(tr["rid"])
+        with self.state_lock:
+            if tr["key"] in self.greeted:
+                return
+            self.greeted[tr["key"]] = None
+        print("Greeting person " + person_id)
+        with self.talking:
             self.tts.say("Hi!")
             self.tts.say("What is your name?")
 
-            print("Asking the listener for a name (person " + str(person_id) + ")")
+            print("Asking the listener for a name (person " + person_id + ")")
             name = self.ask_listener_for_name(person_id)
             if name:
-                self.names[person_id] = name
-                print("Person " + str(person_id) + " is named " + name)
+                with self.state_lock:
+                    self.greeted[tr["key"]] = name
+                print("Person " + person_id + " is named " + name)
                 self.tts.say("Nice to meet you, " + name)
             else:
-                print("Never heard a name for person " + str(person_id))
+                print("Never heard a name for person " + person_id)
                 self.tts.say("Sorry, I did not catch that.")
-        finally:
-            self.talking.release()
 
-    def on_human_left(self, person_id):
-        print("A human has left! id = " + str(person_id))
-
-        timer = threading.Timer(
-            GOODBYE_GRACE_PERIOD, self._say_goodbye, args=(person_id,)
-        )
-        with self.pending_goodbyes_lock:
-            self.pending_goodbyes[person_id] = timer
+    def on_human_left(self, tr):
+        print("A human has left! id = " + str(tr["rid"]))
+        with self.state_lock:
+            greeted = tr["key"] in self.greeted
+        # people we never got to greet leave quietly
+        if not greeted:
+            return
+        timer = threading.Timer(GOODBYE_GRACE_PERIOD, self._say_goodbye, args=(tr,))
+        timer.daemon = True
         timer.start()
 
-    def _say_goodbye(self, person_id):
-        with self.pending_goodbyes_lock:
-            if person_id not in self.pending_goodbyes:
-                return
-            del self.pending_goodbyes[person_id]
-
-        print("Confirmed left, saying goodbye to id = " + str(person_id))
-
-        greet_thread = self.greet_threads.pop(person_id, None)
-        if greet_thread and greet_thread.is_alive():
-            greet_thread.join(timeout=NAME_TIMEOUT + 2)
-
-        name = self.names.pop(person_id, None)
-        if name:
-            self.tts.say("Goodbye, " + name)
-        else:
-            self.tts.say("Goodbye!")
+    def _say_goodbye(self, tr):
+        with self.state_lock:
+            name = self.greeted.pop(tr["key"], False)
+        if name is False:
+            return
+        print("Confirmed left, saying goodbye to id = " + str(tr["rid"]))
+        with self.talking:
+            if name:
+                self.tts.say("Goodbye, " + name)
+            else:
+                self.tts.say("Goodbye!")
 
     def run(self):
         print("Starting HumanGreeter")

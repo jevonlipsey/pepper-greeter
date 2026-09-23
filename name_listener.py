@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LISTEN_FILE = os.path.join(HERE, "listen.txt")
 RESPONSE_FILE = os.path.join(HERE, "response.txt")
 
-MIC_INDEX = 5
+MIC_INDEX = 4
 
 r = sr.Recognizer()
 
@@ -104,10 +104,6 @@ def main():
             command = read_listen_file()
 
             if command == "quit":
-                # stale leftover from a previous shutdown, or the greeter is
-                # just down; the greeter resets this to "no" as soon as it
-                # boots, so never exit here -- just wait. launch order doesn't
-                # matter.
                 if not quit_noted:
                     print(
                         "Greeter not running yet (stale quit). Waiting for it to come up; "
